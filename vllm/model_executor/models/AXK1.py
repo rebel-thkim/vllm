@@ -942,7 +942,6 @@ class AXK1ForCausalLM(
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         return SharedFusedMoE.make_expert_params_mapping(
-            self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
@@ -976,7 +975,6 @@ class AXK1ForCausalLM(
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
         expert_params_mapping = SharedFusedMoE.make_expert_params_mapping(
-            self,
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
@@ -991,7 +989,12 @@ class AXK1ForCausalLM(
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
-        for name, loaded_weight in weights:
+        for name, loaded_weight in weights:            
+            if name.startswith("layers"):
+                layer_idx = int(name.split(".")[1])
+                if layer_idx >= 2:
+                    continue
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
