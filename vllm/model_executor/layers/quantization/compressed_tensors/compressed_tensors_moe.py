@@ -154,6 +154,17 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         input_quant = scheme_dict.get("input_activations")
         format = scheme_dict.get("format")
 
+        # FP8 W8A16 must be checked before _is_wNa16_group_channel because
+        # channel-wise static FP8 weights (naive-quantized format) also match
+        # _is_wNa16_group_channel, which then fails the pack-quantized format check.
+        if (
+            quant_config._is_fp8_w8a16(weight_quant, input_quant)
+            and input_quant is None
+        ):
+            return CompressedTensorsW8A16Fp8MoEMethod(
+                weight_quant, layer.moe_config
+            )
+
         if quant_config._is_wNa16_group_channel(weight_quant, input_quant):
             # group_size=None means channelwise
             group_size = weight_quant.group_size or -1
@@ -203,6 +214,10 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
         ):
             return CompressedTensorsW8A8Fp8MoEMethod(
                 weight_quant, input_quant, layer.moe_config
+            )
+        elif quant_config._is_fp8_w8a16(weight_quant, input_quant):
+            return CompressedTensorsW8A16Fp8MoEMethod(
+                weight_quant, layer.moe_config
             )
         elif quant_config._is_dynamic_token_w8a8(weight_quant, input_quant):
             return CompressedTensorsW8A8Int8MoEMethod(
@@ -1286,6 +1301,175 @@ class CompressedTensorsW8A8Fp8MoEMethod(CompressedTensorsMoEMethod):
                 expert_map=layer.expert_map,
                 quant_config=self.moe_quant_config,
             )
+
+    @property
+    def supports_eplb(self) -> bool:
+        return True
+
+
+class CompressedTensorsW8A16Fp8MoEMethod(CompressedTensorsMoEMethod):
+    """FP8 W8A16 MoE quantization: weight-only FP8 quantization.
+
+    Supports CHANNEL (per-output-channel) and TENSOR (per-tensor)
+    quantization strategies.
+    """
+
+    def __init__(
+        self,
+        weight_quant: QuantizationArgs,
+        moe: FusedMoEConfig,
+    ):
+        super().__init__(moe)
+        self.weight_quant = weight_quant
+        self.strategy = weight_quant.strategy
+        assert self.strategy in (
+            QuantizationStrategy.CHANNEL,
+            QuantizationStrategy.TENSOR,
+            QuantizationStrategy.BLOCK,
+        ), (
+            f"CompressedTensorsW8A16Fp8MoEMethod only supports strategies "
+            f"CHANNEL, TENSOR, BLOCK, got {self.strategy}"
+        )
+        self.weight_block_size = (
+            weight_quant.block_structure
+            if self.strategy == QuantizationStrategy.BLOCK
+            else None
+        )
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        layer.intermediate_size_per_partition = intermediate_size_per_partition
+        layer.hidden_size = hidden_size
+        layer.num_experts = num_experts
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = self.weight_block_size
+
+        params_dtype = torch.float8_e4m3fn
+        w13_num_shards = 2 if self.moe.is_act_and_mul else 1
+        tp_size = get_tensor_model_parallel_world_size()
+
+        if self.strategy == QuantizationStrategy.BLOCK:
+            block_n, block_k = self.weight_block_size[0], self.weight_block_size[1]
+            if intermediate_size_per_partition % block_n != 0:
+                raise ValueError(
+                    f"The output_size of gate's and up's weight = "
+                    f"{intermediate_size_per_partition} is not divisible by "
+                    f"weight quantization block_n = {block_n}."
+                )
+            if tp_size > 1 and intermediate_size_per_partition % block_k != 0:
+                raise ValueError(
+                    f"The input_size of down's weight = "
+                    f"{intermediate_size_per_partition} is not divisible by "
+                    f"weight quantization block_k = {block_k}."
+                )
+
+        w13_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                w13_num_shards * intermediate_size_per_partition,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+
+        w2_weight = torch.nn.Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+
+        if self.strategy == QuantizationStrategy.BLOCK:
+            block_n, block_k = self.weight_block_size[0], self.weight_block_size[1]
+            w13_scale_shape = (
+                num_experts,
+                w13_num_shards
+                * ((intermediate_size_per_partition + block_n - 1) // block_n),
+                (hidden_size + block_k - 1) // block_k,
+            )
+            w2_scale_shape = (
+                num_experts,
+                (hidden_size + block_n - 1) // block_n,
+                (intermediate_size_per_partition + block_k - 1) // block_k,
+            )
+            scale_quant_method = FusedMoeWeightScaleSupported.BLOCK.value
+        elif self.strategy == QuantizationStrategy.CHANNEL:
+            w13_scale_shape = (
+                num_experts,
+                w13_num_shards * intermediate_size_per_partition,
+                1,
+            )
+            w2_scale_shape = (num_experts, hidden_size, 1)
+            scale_quant_method = FusedMoeWeightScaleSupported.CHANNEL.value
+        else:  # TENSOR
+            w13_scale_shape = (num_experts,)
+            w2_scale_shape = (num_experts,)
+            scale_quant_method = FusedMoeWeightScaleSupported.TENSOR.value
+
+        w13_weight_scale = torch.nn.Parameter(
+            torch.ones(w13_scale_shape, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight_scale", w13_weight_scale)
+        extra_weight_attrs.update({"quant_method": scale_quant_method})
+        set_weight_attrs(w13_weight_scale, extra_weight_attrs)
+
+        w2_weight_scale = torch.nn.Parameter(
+            torch.ones(w2_scale_shape, dtype=torch.float32),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight_scale", w2_weight_scale)
+        set_weight_attrs(w2_weight_scale, extra_weight_attrs)
+
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
+    def process_weights_after_loading(self, layer: FusedMoE) -> None:
+        w13 = layer.w13_weight
+        w2 = layer.w2_weight
+        w13_scale = layer.w13_weight_scale
+        w2_scale = layer.w2_weight_scale
+
+        if current_platform.is_fp8_fnuz():
+            w13, w13_scale, _ = normalize_e4m3fn_to_e4m3fnuz(w13, w13_scale, None)
+            w2, w2_scale, _ = normalize_e4m3fn_to_e4m3fnuz(w2, w2_scale, None)
+
+        replace_parameter(layer, "w13_weight", w13)
+        replace_parameter(layer, "w2_weight", w2)
+        replace_parameter(layer, "w13_weight_scale", w13_scale)
+        replace_parameter(layer, "w2_weight_scale", w2_scale)
+
+    @property
+    def is_monolithic(self) -> bool:
+        return False
+
+    def apply(
+        self,
+        layer: FusedMoE,
+        x: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        raise NotImplementedError(
+            "CompressedTensorsW8A16Fp8MoEMethod GPU apply not available. "
+            "Use CPU dequant path instead."
+        )
 
     @property
     def supports_eplb(self) -> bool:
