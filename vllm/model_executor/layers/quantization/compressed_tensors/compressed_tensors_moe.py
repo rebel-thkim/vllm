@@ -92,6 +92,7 @@ from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.scalar_type import scalar_types
+from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.utils.deep_gemm import (
     get_col_major_tma_aligned_tensor,
     get_mk_alignment_for_contiguous_layout,
@@ -100,6 +101,50 @@ from vllm.utils.deep_gemm import (
 from vllm.utils.import_utils import has_deep_gemm
 
 logger = init_logger(__name__)
+
+
+def _cpu_fp8_dequant_moe(
+    output: torch.Tensor,
+    x: torch.Tensor,
+    w13_weight: torch.Tensor,
+    w2_weight: torch.Tensor,
+    w13_weight_scale: torch.Tensor,
+    w2_weight_scale: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> None:
+    num_experts = w13_weight.shape[0]
+    intermediate_size = w13_weight.shape[1] // 2
+
+    output.zero_()
+
+    for e in range(num_experts):
+        mask = topk_ids == e
+        if not mask.any():
+            continue
+
+        token_indices, topk_positions = torch.where(mask)
+        weights = topk_weights[token_indices, topk_positions].unsqueeze(1)
+        x_sel = x[token_indices]
+
+        w13 = w13_weight[e].to(x.dtype) * w13_weight_scale[e].to(x.dtype)
+        gate_up = x_sel @ w13.T
+        gate = gate_up[:, :intermediate_size]
+        up = gate_up[:, intermediate_size:]
+        hidden = torch.nn.functional.silu(gate) * up
+
+        w2 = w2_weight[e].to(x.dtype) * w2_weight_scale[e].to(x.dtype)
+        out = hidden @ w2.T
+        output.index_add_(
+            0, token_indices, (weights * out).to(output.dtype)
+        )
+
+
+direct_register_custom_op(
+    op_name="cpu_fp8_dequant_moe",
+    op_func=_cpu_fp8_dequant_moe,
+    mutates_args=["output"],
+)
 
 
 class GPTQMarlinState(Enum):
@@ -1440,6 +1485,10 @@ class CompressedTensorsW8A16Fp8MoEMethod(CompressedTensorsMoEMethod):
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: FusedMoE) -> None:
+        if current_platform.is_cpu():
+            layer._use_cpu_dequant = True
+            return
+
         w13 = layer.w13_weight
         w2 = layer.w2_weight
         w13_scale = layer.w13_weight_scale
@@ -1466,6 +1515,20 @@ class CompressedTensorsW8A16Fp8MoEMethod(CompressedTensorsMoEMethod):
         topk_ids: torch.Tensor,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if getattr(layer, "_use_cpu_dequant", False):
+            output = torch.empty_like(x)
+            torch.ops.vllm.cpu_fp8_dequant_moe(
+                output,
+                x,
+                layer.w13_weight,
+                layer.w2_weight,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                topk_weights,
+                topk_ids,
+            )
+            return output
+
         raise NotImplementedError(
             "CompressedTensorsW8A16Fp8MoEMethod GPU apply not available. "
             "Use CPU dequant path instead."

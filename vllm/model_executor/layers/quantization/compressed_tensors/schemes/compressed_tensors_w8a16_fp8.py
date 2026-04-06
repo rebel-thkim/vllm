@@ -4,6 +4,7 @@
 from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 from compressed_tensors.quantization import QuantizationStrategy
 
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
@@ -41,6 +42,8 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
     # So if we have a fused module (QKV, MLP) with per tensor scales,
     # we expand each scale to its shard's channels.
     def process_weights_after_loading(self, layer) -> None:
+        is_cpu = layer.weight.device.type != "cuda"
+
         if self.strategy == QuantizationStrategy.TENSOR:
             ws_channelwise = convert_to_channelwise(
                 layer.weight_scale, layer.logical_widths
@@ -52,15 +55,20 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
                 layer.weight_scale.data, requires_grad=False
             )
 
-        # Weights must be transposed for marlin
-        layer.weight = torch.nn.Parameter(layer.weight.t(), requires_grad=False)
+        if not is_cpu:
+            # Weights must be transposed for marlin
+            layer.weight = torch.nn.Parameter(layer.weight.t(), requires_grad=False)
 
         if self.is_static_input_scheme:
             # required by torch.compile to be torch.nn.Parameter
             layer.input_scale = torch.nn.Parameter(
                 layer.input_scale.data, requires_grad=False
             )
-        prepare_fp8_layer_for_marlin(layer)
+
+        if is_cpu:
+            layer._use_cpu_dequant = True
+        else:
+            prepare_fp8_layer_for_marlin(layer)
 
     def create_weights(
         self,
@@ -127,6 +135,10 @@ class CompressedTensorsW8A16Fp8(CompressedTensorsScheme):
         x: torch.Tensor,
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "_use_cpu_dequant", False):
+            dequant_w = layer.weight.to(x.dtype) * layer.weight_scale.to(x.dtype)
+            return F.linear(x, dequant_w, bias)
+
         return apply_fp8_marlin_linear(
             input=x,
             weight=layer.weight,
