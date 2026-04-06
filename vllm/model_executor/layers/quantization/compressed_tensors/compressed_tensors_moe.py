@@ -1511,10 +1511,13 @@ class CompressedTensorsW8A16Fp8MoEMethod(CompressedTensorsMoEMethod):
         self,
         layer: FusedMoE,
         x: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-        shared_experts_input: torch.Tensor | None,
+        router_logits: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        topk_weights, topk_ids, _ = layer.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+        )
+
         if getattr(layer, "_use_cpu_dequant", False):
             output = torch.empty_like(x)
             torch.ops.vllm.cpu_fp8_dequant_moe(
@@ -1533,6 +1536,11 @@ class CompressedTensorsW8A16Fp8MoEMethod(CompressedTensorsMoEMethod):
             "CompressedTensorsW8A16Fp8MoEMethod GPU apply not available. "
             "Use CPU dequant path instead."
         )
+
+    def get_fused_moe_quant_config(
+        self, layer: torch.nn.Module
+    ) -> FusedMoEQuantConfig | None:
+        return None
 
     @property
     def supports_eplb(self) -> bool:
